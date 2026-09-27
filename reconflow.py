@@ -744,6 +744,210 @@ async def run_wpscan(url, args, cfg, console):
     return findings
 
 
+# ---- subdomain enumeration (passive: certificate transparency) -------------
+async def _resolve_host(host):
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+        ips = []
+        for *_, sa in infos:
+            if sa[0] not in ips:
+                ips.append(sa[0])
+        return ips
+    except Exception:
+        return []
+
+
+async def enumerate_subdomains(session, domain, timeout, do_resolve, console):
+    subs = set()
+    url = f"https://crt.sh/?q=%25.{domain}&output=json"
+    console.print(f"[dim]$ crt.sh lookup for %.{domain}[/]")
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=max(timeout, 25))) as resp:
+            data = await resp.json(content_type=None)
+        for row in data or []:
+            for nm in str(row.get("name_value", "")).split("\n"):
+                nm = nm.strip().lstrip("*.").lower()
+                if nm and nm.endswith(domain) and nm != domain and " " not in nm:
+                    subs.add(nm)
+    except Exception as e:
+        console.print(f"[yellow]crt.sh lookup failed: {e}[/]")
+    subs = sorted(subs)
+    results = []
+    if do_resolve and subs:
+        sem = asyncio.Semaphore(50)
+
+        async def one(h):
+            async with sem:
+                ips = await _resolve_host(h)
+            results.append({"host": h, "ips": ips})
+            if ips:
+                console.print(f"  [green]{h}[/] -> {', '.join(ips[:3])}")
+
+        await asyncio.gather(*(one(s) for s in subs[:500]))
+        results.sort(key=lambda r: r["host"])
+        live = sum(1 for r in results if r["ips"])
+        console.print(f"[bold]{len(subs)} subdomain(s) found, {live} resolve to an IP.[/]")
+    else:
+        results = [{"host": s, "ips": []} for s in subs]
+        for s in subs:
+            console.print(f"  {s}")
+        console.print(f"[bold]{len(subs)} subdomain(s) found.[/]")
+    return results
+
+
+# ---- JS + Wayback endpoint mining ------------------------------------------
+JS_PATH_RE = re.compile(rb"""["'`](/[a-zA-Z0-9_\-./]{1,120})["'`]""")
+FULLURL_RE = re.compile(rb"""https?://[a-zA-Z0-9._\-]+/[a-zA-Z0-9_\-./?=&%]{0,150}""")
+SECRET_RES = [
+    ("AWS access key", re.compile(rb"AKIA[0-9A-Z]{16}")),
+    ("Google API key", re.compile(rb"AIza[0-9A-Za-z_\-]{35}")),
+    ("Slack token", re.compile(rb"xox[baprs]-[0-9A-Za-z-]{10,48}")),
+    ("JWT", re.compile(rb"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}")),
+    ("private key block", re.compile(rb"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----")),
+    ("api key/secret assignment",
+     re.compile(rb"""(?i)(?:api[_-]?key|secret|access[_-]?token)["']?\s*[:=]\s*["'][0-9A-Za-z_\-]{16,}["']""")),
+]
+
+
+def mine_js_body(body):
+    """Extract candidate paths, full URLs, and secret hits from a JS/HTML body."""
+    paths, urls, secrets = set(), set(), []
+    for m in JS_PATH_RE.finditer(body or b""):
+        paths.add(m.group(1).decode("utf-8", "ignore").lstrip("/"))
+    for m in FULLURL_RE.finditer(body or b""):
+        urls.add(m.group(0).decode("utf-8", "ignore"))
+    for label, rx in SECRET_RES:
+        if rx.search(body or b""):
+            secrets.append(label)
+    return paths, urls, secrets
+
+
+async def mine_endpoints(session, http_results, domain, timeout, console):
+    paths, endpoints, secrets, js_files = set(), set(), [], []
+    js_urls = []
+    for r in http_results:
+        base = r.final_url or r.url
+        p = urlparse(base)
+        origin = f"{p.scheme}://{p.netloc}"
+        for lp in (r.links or []):
+            low = lp.lower()
+            if low.endswith(".js") or ".js?" in low:
+                js_urls.append(origin + "/" + lp.lstrip("/"))
+    js_urls = list(dict.fromkeys(js_urls))[:15]
+    for ju in js_urls:
+        try:
+            async with session.get(ju, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                body = await resp.content.read(500_000)
+        except Exception:
+            continue
+        js_files.append(ju)
+        pp, uu, ss = mine_js_body(body)
+        paths |= pp
+        endpoints |= uu
+        for label in ss:
+            secrets.append({"type": label, "location": ju})
+            console.print(f"  [red]possible {label}[/] in {ju}")
+    wb_count = 0
+    if domain:
+        wb = (f"http://web.archive.org/cdx/search/cdx?url={domain}/*"
+              f"&output=json&fl=original&collapse=urlkey&limit=3000")
+        console.print("[dim]$ wayback (web.archive.org) lookup[/]")
+        try:
+            async with session.get(wb, timeout=aiohttp.ClientTimeout(total=max(timeout, 25))) as resp:
+                data = await resp.json(content_type=None)
+            for row in (data[1:] if isinstance(data, list) and len(data) > 1 else []):
+                u = row[0] if isinstance(row, list) and row else ""
+                pu = urlparse(u)
+                if pu.path and len(pu.path) <= 128:
+                    paths.add(pu.path.lstrip("/"))
+                    wb_count += 1
+        except Exception as e:
+            console.print(f"[yellow]wayback lookup failed: {e}[/]")
+    paths.discard("")
+    console.print(f"[bold]mined: {len(js_files)} JS file(s), {len(paths)} path(s), "
+                  f"{wb_count} wayback URL(s), {len(secrets)} secret hit(s).[/]")
+    return {"js_files": js_files, "paths": sorted(paths)[:1000],
+            "endpoints": sorted(endpoints)[:200], "secrets": secrets, "wayback_count": wb_count}
+
+
+# ---- security audit (headers / cookies / CORS / TLS) -----------------------
+SEC_HEADERS = {
+    "content-security-policy": "CSP",
+    "strict-transport-security": "HSTS",
+    "x-frame-options": "X-Frame-Options",
+    "x-content-type-options": "X-Content-Type-Options",
+    "referrer-policy": "Referrer-Policy",
+    "permissions-policy": "Permissions-Policy",
+}
+
+
+def cert_audit(host, port, timeout=6):
+    import ssl
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                cert = ss.getpeercert()
+        sans = [v for (k, v) in cert.get("subjectAltName", ()) if k == "DNS"]
+        return {"trusted": True, "notAfter": cert.get("notAfter"), "sans": sans}
+    except Exception as e:  # noqa: BLE001 - report untrusted/expired without a crypto dep
+        return {"trusted": False, "error": type(e).__name__}
+
+
+async def audit_endpoint(session, url, timeout, console):
+    findings = []
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            cookies = resp.headers.getall("Set-Cookie", []) if hasattr(resp.headers, "getall") \
+                else ([resp.headers["Set-Cookie"]] if "Set-Cookie" in resp.headers else [])
+    except Exception as e:
+        console.print(f"[yellow]audit failed for {url}: {e}[/]")
+        return findings
+    missing = [label for h, label in SEC_HEADERS.items() if h not in hdrs]
+    if missing:
+        findings.append(VulnFinding("audit", "Missing security headers: " + ", ".join(missing),
+                                    "low", url, ""))
+    for c in cookies:
+        cl = c.lower()
+        flags = [f for f, present in (("Secure", "secure" in cl),
+                                      ("HttpOnly", "httponly" in cl),
+                                      ("SameSite", "samesite" in cl)) if not present]
+        if flags:
+            findings.append(VulnFinding("audit", f"Cookie '{c.split('=', 1)[0]}' missing: "
+                                        + ", ".join(flags), "low", url, ""))
+    # CORS reflection (single benign GET with a crafted Origin)
+    try:
+        probe = "https://recon-flow-probe.invalid"
+        async with session.get(url, headers={"Origin": probe},
+                               timeout=aiohttp.ClientTimeout(total=timeout)) as resp2:
+            acao = resp2.headers.get("Access-Control-Allow-Origin", "")
+            acac = (resp2.headers.get("Access-Control-Allow-Credentials", "") or "").lower()
+        if acao == "*":
+            findings.append(VulnFinding("audit", "CORS: Access-Control-Allow-Origin: * (wildcard)",
+                                        "info", url, ""))
+        elif acao == probe:
+            with_creds = acac == "true"
+            findings.append(VulnFinding(
+                "audit", "CORS reflects arbitrary Origin" + (" + credentials" if with_creds else ""),
+                "medium" if with_creds else "low", url, ""))
+    except Exception:
+        pass
+    # TLS certificate (https only)
+    p = urlparse(url)
+    if p.scheme == "https" and p.hostname:
+        info = await asyncio.to_thread(cert_audit, p.hostname, p.port or 443)
+        if info and not info.get("trusted"):
+            findings.append(VulnFinding("audit", f"TLS certificate not trusted ({info.get('error')})",
+                                        "medium", url, ""))
+        elif info and info.get("notAfter"):
+            findings.append(VulnFinding("audit", f"TLS cert valid until {info['notAfter']}",
+                                        "info", url, ""))
+    for f in findings:
+        console.print(f"  [bold]{f.severity.upper()}[/] {f.name}")
+    return findings
+
+
 # ---- report ----------------------------------------------------------------
 def write_html(path, r):
     esc = lambda v: html.escape(str(v))
@@ -782,6 +986,17 @@ def write_html(path, r):
     else:
         out.append("<p class='muted'>None.</p>")
 
+    out.append("<h2>Subdomains</h2>")
+    subs = r.get("subdomains") or []
+    if subs:
+        out.append("<table><tr><th>Subdomain</th><th>Resolves to</th></tr>")
+        for s in subs:
+            out.append("<tr><td>%s</td><td>%s</td></tr>" % (
+                esc(s.get("host", "")), esc(", ".join(s.get("ips", [])) or "-")))
+        out.append("</table>")
+    else:
+        out.append("<p class='muted'>Not run, or none found.</p>")
+
     out.append("<h2>Content discovery</h2>")
     if r["content"]:
         for sec in r["content"]:
@@ -803,7 +1018,23 @@ def write_html(path, r):
     else:
         out.append("<p class='muted'>Not run.</p>")
 
-    out.append("<h2>Vulnerability detection</h2>")
+    out.append("<h2>Mined endpoints (JS + Wayback)</h2>")
+    mined = r.get("mined") or {}
+    if mined:
+        out.append("<p class='muted'>%s JS file(s) &middot; %s path(s) &middot; %s Wayback URL(s) "
+                   "&middot; %s secret hit(s)</p>" % (
+                       esc(len(mined.get("js_files", []))), esc(len(mined.get("paths", []))),
+                       esc(mined.get("wayback_count", 0)), esc(len(mined.get("secrets", [])))))
+        eps = mined.get("endpoints", [])
+        if eps:
+            out.append("<details><summary>Full URLs (%s)</summary><ul>" % esc(len(eps)))
+            for e in eps[:200]:
+                out.append("<li>%s</li>" % esc(e))
+            out.append("</ul></details>")
+    else:
+        out.append("<p class='muted'>Not run.</p>")
+
+    out.append("<h2>Findings (vuln / audit / mining)</h2>")
     vulns = r.get("vuln") or []
     if vulns:
         order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
@@ -836,8 +1067,13 @@ async def run(args, cfg, console):
     phases = [p.strip() for p in args.phases.split(",") if p.strip()]
     if args.vuln and "vuln" not in phases:
         phases.append("vuln")
+    for flag, name in (("subs", "subs"), ("mine", "mine"), ("audit", "audit")):
+        if getattr(args, flag, False) and name not in phases:
+            phases.append(name)
 
-    ips, open_ports, http_results, content_sections, vuln_findings = [], [], [], [], []
+    ips, open_ports, http_results = [], [], []
+    content_sections, vuln_findings = [], []
+    subdomains, mined = [], {}
 
     if args.url:
         parsed = urlparse(args.url if "://" in args.url else "http://" + args.url)
@@ -858,14 +1094,27 @@ async def run(args, cfg, console):
                                       args.port_timeout, console)
         console.print(f"[bold]{len(open_ports)} open port(s).[/]")
 
-    need_http = any(p in phases for p in ("http", "content", "vuln"))
+    need_http = any(p in phases for p in ("subs", "http", "content", "vuln", "mine", "audit"))
     if need_http and aiohttp is None:
         console.print("[red]aiohttp not installed - run: pip install -r requirements.txt[/]")
     elif need_http:
         connector = aiohttp.TCPConnector(ssl=False, limit=0)
         headers = {"User-Agent": d.get("user_agent", "ReconFlow/1.0")}
         async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-            if "http" in phases:
+            if "subs" in phases:
+                console.rule("[bold]Subdomain enumeration")
+                if args.url:
+                    dom = urlparse(args.url if "://" in args.url else "http://" + args.url).hostname
+                else:
+                    dom = target
+                is_ip = bool(dom) and all(part.isdigit() for part in (dom or "").split("."))
+                if not dom or is_ip:
+                    console.print("[yellow]Subdomain enum needs a domain name; skipping for IP.[/]")
+                else:
+                    subdomains = await enumerate_subdomains(
+                        session, dom, args.http_timeout, not args.no_subs_resolve, console)
+
+            if any(p in phases for p in ("http", "content", "mine", "audit")):
                 console.rule("[bold]Phase 3 - HTTP probe")
                 if args.url:
                     res = await probe_url(session, args.url, args.http_timeout, console)
@@ -879,6 +1128,28 @@ async def run(args, cfg, console):
                         res = await probe_http(session, target, port, args.http_timeout, console)
                         if res:
                             http_results.append(res)
+
+            if "mine" in phases:
+                console.rule("[bold]Endpoint mining (JS + Wayback)")
+                if args.url:
+                    dom_m = urlparse(args.url if "://" in args.url else "http://" + args.url).hostname
+                elif target and not all(p.isdigit() for p in target.split(".")):
+                    dom_m = target
+                else:
+                    dom_m = None
+                mined = await mine_endpoints(session, http_results, dom_m, args.http_timeout, console)
+                for s in mined.get("secrets", []):
+                    vuln_findings.append(VulnFinding("mine", f"Possible {s['type']} in JS",
+                                                     "medium", s["location"], ""))
+
+            if "audit" in phases:
+                console.rule("[bold]Security audit (headers / CORS / cookies / TLS)")
+                bases_a = compute_bases(args, http_results)
+                if not bases_a:
+                    console.print("[yellow]No live endpoint to audit.[/]")
+                for base in bases_a:
+                    console.print(f"[bold]Auditing[/] {base}")
+                    vuln_findings += await audit_endpoint(session, base, args.http_timeout, console)
 
             if "content" in phases:
                 console.rule("[bold]Phase 4 - Content discovery")
@@ -899,6 +1170,10 @@ async def run(args, cfg, console):
                                 if lp not in seen_seed:
                                     seen_seed.add(lp)
                                     seeds.append(lp)
+                        for mp in mined.get("paths", []):
+                            if mp not in seen_seed:
+                                seen_seed.add(mp)
+                                seeds.append(mp)
                         if seeds:
                             console.print(f"[dim]{len(seeds)} path(s) seeded from in-page links.[/]")
                         for base in bases:
@@ -945,6 +1220,8 @@ async def run(args, cfg, console):
         "ports": [{"port": p, "service": service_name(p)} for p in open_ports],
         "http": [asdict(r) for r in http_results],
         "content": content_sections,
+        "subdomains": subdomains,
+        "mined": mined,
         "vuln": [asdict(v) for v in vuln_findings],
     }
     outdir = Path(args.output or default_outdir(target))
@@ -987,6 +1264,15 @@ def build_parser():
                    help="interactive menu: pick target, phases, wordlist, etc.")
     p.add_argument("--no-builtin", action="store_true",
                    help="do not include the built-in high-signal path list")
+    # recon add-ons (opt-in phases)
+    p.add_argument("--subs", action="store_true",
+                   help="subdomain enumeration phase (crt.sh, then DNS resolve)")
+    p.add_argument("--no-subs-resolve", action="store_true",
+                   help="with --subs, list names without DNS-resolving them")
+    p.add_argument("--mine", action="store_true",
+                   help="endpoint mining phase (parse linked JS + Wayback URLs)")
+    p.add_argument("--audit", action="store_true",
+                   help="security audit phase (headers, CORS, cookie flags, TLS)")
     # vulnerability detection (opt-in; wraps external DETECTION scanners)
     p.add_argument("--vuln", action="store_true",
                    help="add the vuln phase (runs nuclei + wpscan, detection-only)")

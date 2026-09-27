@@ -93,6 +93,9 @@ python reconflow.py example.com --yes --http-concurrency 10 --delay 0.1
 | `http` | Fetches each open web port; records status, `Server`, title, tech, redirects. |
 | `content` | Directory/file discovery with SecLists wordlist(s) + soft-404 filtering. |
 | `vuln` | **Opt-in** (`--vuln`). Runs Nuclei on live URLs + WPScan on any WordPress. Detection only. |
+| `subs` | **Opt-in** (`--subs`). Passive subdomain enumeration (crt.sh) + DNS resolve. |
+| `mine` | **Opt-in** (`--mine`). Parse linked JS for paths/secrets + harvest Wayback URLs; feeds content discovery. |
+| `audit` | **Opt-in** (`--audit`). Security headers, CORS, cookie flags, TLS cert per live service. |
 
 Select phases with `--phases` (default: `resolve,ports,http,content`). `--vuln` adds the vuln phase.
 
@@ -134,6 +137,9 @@ Example: `--wordlist common,exposed`
 | `--yes` | Skip the authorization prompt. |
 | `-i`, `--interactive` | Interactive menu: pick target, phases, wordlist, etc. (nmap-style). |
 | `--no-builtin` | Skip the built-in high-signal path list (use only your wordlist). |
+| `--subs` | Subdomain enumeration (crt.sh + resolve). Add `--no-subs-resolve` to skip DNS. |
+| `--mine` | Endpoint mining: parse linked JS (paths + secret patterns) + Wayback URLs. |
+| `--audit` | Security audit: headers, CORS, cookie flags, TLS certificate. |
 
 Defaults live in `config.yaml`; CLI flags override them.
 
@@ -168,6 +174,31 @@ Two extras catch obvious pages like `/login` and `/register` even with a small l
 - **In-page link extraction** — ReconFlow reads the page it already fetched in the HTTP
   phase and seeds any same-site links (`href`/`src`/`action`) into content discovery, so
   routes linked from the homepage are found even when no wordlist contains them.
+
+---
+
+## Recon add-ons (`--subs`, `--mine`, `--audit`)
+
+Opt-in phases that broaden coverage — all detection-only:
+
+- **`--subs`** — passive subdomain enumeration via certificate transparency (crt.sh),
+  then DNS-resolves each name. `--no-subs-resolve` to just list them.
+- **`--mine`** — fetches the JavaScript linked from the page, extracts API paths (seeded
+  into content discovery) and flags likely secrets (AWS/Google keys, JWTs, private keys),
+  and harvests historical URLs from the Wayback Machine.
+- **`--audit`** — per live service: missing security headers, CORS reflection, cookie
+  flags (Secure/HttpOnly/SameSite), and TLS certificate trust/expiry.
+
+```bash
+python reconflow.py example.com --subs --mine --audit
+```
+
+```bash
+python reconflow.py example.com --subs --no-subs-resolve
+```
+
+`--audit` findings and `--mine` secret hits appear in the report's **Findings** table;
+subdomains and mined endpoints get their own report sections.
 
 ---
 
