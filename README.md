@@ -51,6 +51,12 @@ Full pipeline against a host (asks for authorization confirmation):
 python reconflow.py example.com
 ```
 
+Interactive menu — pick target, phases, and wordlist step by step (like an nmap UI):
+
+```bash
+python reconflow.py -i
+```
+
 Skip the port scan and enumerate a known URL directly:
 
 ```bash
@@ -126,6 +132,8 @@ Example: `--wordlist common,exposed`
 | `--seclists PATH` | Path to your SecLists clone. |
 | `--output DIR` | Report output directory. |
 | `--yes` | Skip the authorization prompt. |
+| `-i`, `--interactive` | Interactive menu: pick target, phases, wordlist, etc. (nmap-style). |
+| `--no-builtin` | Skip the built-in high-signal path list (use only your wordlist). |
 
 Defaults live in `config.yaml`; CLI flags override them.
 
@@ -147,7 +155,19 @@ The terminal also prints a live summary as each phase runs.
 Before enumerating, ReconFlow requests a few random paths to learn how the server
 responds to "not found" (its status + body length). Any discovered path matching that
 **soft-404 baseline** is filtered out — so servers that return `200` for everything
-don't flood your results.
+don't flood your results. On **wildcard/SPA sites** the filter compares response
+*bodies* (hash), not just size, so real routes aren't hidden.
+
+### Finding pages that aren't in your wordlist
+
+Two extras catch obvious pages like `/login` and `/register` even with a small list:
+
+- **Built-in path list** — a curated set of high-signal paths (auth, admin, api, docs,
+  `.git`, `.env`, backups, …) is always tried, so you're never dependent on SecLists
+  being installed. Disable with `--no-builtin`.
+- **In-page link extraction** — ReconFlow reads the page it already fetched in the HTTP
+  phase and seeds any same-site links (`href`/`src`/`action`) into content discovery, so
+  routes linked from the homepage are found even when no wordlist contains them.
 
 ---
 

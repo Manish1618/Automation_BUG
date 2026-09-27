@@ -14,6 +14,7 @@ explicitly authorized to test (bug bounty scope / written permission).
 
 import argparse
 import asyncio
+import hashlib
 import html
 import json
 import random
@@ -88,6 +89,29 @@ NON_WEB_PORTS = {21, 22, 23, 25, 53, 110, 111, 135, 137, 139, 143, 161, 179,
 FALLBACK_WEB_PORTS = [80, 443, 8080, 8443, 8000, 3000, 5000]
 
 TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
+# Attribute values that reference same-app resources (depth-1 link extraction).
+LINK_RE = re.compile(rb"""(?:href|src|action)\s*=\s*["']([^"'>\s]+)["']""", re.I)
+
+# High-signal paths always tried, even without SecLists. Fixes "can't find /login".
+BUILTIN_PATHS = [
+    "login", "log-in", "signin", "sign-in", "logout", "register", "signup",
+    "sign-up", "auth", "oauth", "sso", "account", "accounts", "profile", "user",
+    "users", "admin", "administrator", "admin/login", "wp-admin", "wp-login.php",
+    "dashboard", "portal", "cms", "console", "manage", "management",
+    "password-reset", "forgot-password", "reset-password", "verify",
+    "api", "api/v1", "api/v2", "graphql", "rest", "swagger", "swagger-ui",
+    "swagger-ui.html", "openapi.json", "api-docs", "docs", "redoc",
+    "health", "healthz", "status", "metrics", "actuator", "actuator/health",
+    "debug", "test", "dev", "staging", "old", "backup", "backups", "tmp",
+    "config", "configuration", "settings", "phpinfo.php", "phpmyadmin",
+    "server-status", "server-info", "robots.txt", "sitemap.xml", "crossdomain.xml",
+    ".env", ".git/HEAD", ".git/config", ".svn/entries", ".DS_Store",
+    "web.config", "config.json", "credentials", "secrets",
+    "upload", "uploads", "files", "download", "downloads", "static", "assets",
+    "media", "images", "img", "css", "js", "home", "index", "about", "contact",
+    "search", "cart", "checkout", "orders", "payment", "billing", "invoice",
+    "report", "reports", "export", "import", "webhook", "callback", "internal",
+]
 
 CSS = """
 body{background:#0d1117;color:#c9d1d9;font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0}
@@ -146,6 +170,7 @@ class HttpResult:
     content_type: str = ""
     length: int = 0
     tech: list = field(default_factory=list)
+    links: list = field(default_factory=list)
 
 
 @dataclass
@@ -243,6 +268,41 @@ def extract_title(body):
     return " ".join(t.split())[:200]
 
 
+def extract_links(body, base_url):
+    """Depth-1 link extraction: same-host paths referenced by the page.
+
+    Finds routes like /login and /register that are linked from the page but
+    may not be in any wordlist. Returns clean relative paths (no leading '/').
+    """
+    try:
+        base = urlparse(base_url)
+    except Exception:
+        return []
+    out, seen = [], set()
+    for m in LINK_RE.finditer(body or b""):
+        try:
+            raw = m.group(1).decode("utf-8", "ignore").strip()
+        except Exception:
+            continue
+        if not raw or raw.startswith(("#", "mailto:", "tel:", "javascript:", "data:")):
+            continue
+        u = urlparse(raw)
+        if u.scheme in ("http", "https"):
+            if u.hostname and base.hostname and u.hostname != base.hostname:
+                continue  # off-site link
+            path = u.path
+        elif u.scheme:
+            continue  # non-web scheme
+        else:
+            path = u.path
+        path = (path or "").lstrip("/").strip()
+        if not path or len(path) > 128 or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
 def detect_tech(headers, body):
     server = headers.get("Server", "")
     powered = headers.get("X-Powered-By", "")
@@ -297,16 +357,19 @@ def load_words(args, cfg, console):
     base = find_seclists_base(args, cfg)
     names = [n.strip() for n in str(args.wordlist).split(",") if n.strip()]
     words, seen = [], set()
+    # Built-in high-signal paths first, so /login, /admin, .env etc. are always
+    # tried even when SecLists is absent or the chosen list is tiny.
+    if not getattr(args, "no_builtin", False):
+        for w in BUILTIN_PATHS:
+            if w not in seen:
+                seen.add(w)
+                words.append(w)
+    missing = []
     for name in names:
         path = resolve_wordlist(name, cfg, base)
         if not path:
-            console.print(
-                f"[red]Wordlist '{name}' not found.[/] Point --seclists / config.yaml "
-                f"at your SecLists clone, or pass a direct file path."
-            )
-            if base is None:
-                console.print("[yellow]No SecLists directory was found on this machine.[/]")
-            return None
+            missing.append(name)
+            continue
         try:
             for line in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
                 w = line.strip()
@@ -317,8 +380,14 @@ def load_words(args, cfg, console):
                     seen.add(w)
                     words.append(w)
         except Exception as e:
-            console.print(f"[red]Could not read {path}: {e}[/]")
-            return None
+            console.print(f"[yellow]Could not read {path}: {e}[/]")
+    if missing:
+        only = " only" if len(missing) == len(names) else ""
+        console.print(f"[yellow]Wordlist(s) not found: {', '.join(missing)}.[/] "
+                      f"Using built-in paths{only}. Point --seclists / config.yaml at "
+                      f"SecLists, or pass a file path.")
+        if base is None:
+            console.print("[dim]No SecLists directory found on this machine.[/]")
     if args.max_paths and len(words) > args.max_paths:
         words = words[: args.max_paths]
     return words
@@ -409,6 +478,7 @@ async def _probe_one(session, url, timeout):
             content_type=resp.headers.get("Content-Type", "").split(";")[0],
             length=int(resp.headers.get("Content-Length") or len(body)),
             tech=detect_tech(resp.headers, body),
+            links=extract_links(body, str(resp.url)),
         )
 
 
@@ -417,6 +487,8 @@ async def probe_http(session, host, port, timeout, console):
         try:
             res = await _probe_one(session, url, timeout)
             console.print(f"  [cyan]{res.status}[/] {url}  [dim]{res.server}[/]  {res.title[:60]}")
+            if res.links:
+                console.print(f"  [dim]{len(res.links)} in-page link(s) extracted[/]")
             return res
         except Exception:
             continue
@@ -428,6 +500,8 @@ async def probe_url(session, url, timeout, console):
     try:
         res = await _probe_one(session, u, timeout)
         console.print(f"  [cyan]{res.status}[/] {u}  [dim]{res.server}[/]  {res.title[:60]}")
+        if res.links:
+            console.print(f"  [dim]{len(res.links)} in-page link(s) extracted[/]")
         return res
     except Exception as e:
         console.print(f"[yellow]Probe failed for {u}: {e}[/]")
@@ -435,6 +509,10 @@ async def probe_url(session, url, timeout, console):
 
 
 # ---- content discovery -----------------------------------------------------
+def _body_hash(body):
+    return hashlib.sha1(body or b"").hexdigest()[:16]
+
+
 async def calibrate(session, base, timeout):
     sigs = []
     for _ in range(3):
@@ -443,9 +521,9 @@ async def calibrate(session, base, timeout):
         try:
             async with session.get(url, allow_redirects=False,
                                    timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                body = await resp.content.read(2048)
+                body = await resp.content.read(4096)
                 length = int(resp.headers.get("Content-Length") or len(body))
-                sig = [resp.status, length]
+                sig = {"status": resp.status, "length": length, "hash": _body_hash(body)}
                 if sig not in sigs:
                     sigs.append(sig)
         except Exception:
@@ -453,25 +531,46 @@ async def calibrate(session, base, timeout):
     return sigs
 
 
-def is_fp(status, length, sigs):
-    for s, l in sigs:
-        if s == status and abs(length - l) <= 64:
+def is_fp(status, length, bhash, sigs):
+    """Discard a result as a soft-404 only when it truly matches the baseline.
+
+    On wildcard-200 sites (SPA/catch-all) every path returns the same shell, so a
+    real route and a miss can share status+length; we only discard when the body
+    is byte-identical. For other baseline statuses, a close size match is enough.
+    """
+    for sig in sigs:
+        if sig["status"] != status:
+            continue
+        if status == 200:
+            if sig["hash"] == bhash:
+                return True
+        elif abs(length - sig["length"]) <= 64:
             return True
     return False
 
 
 async def discover_content(session, base, words, exts, match_codes,
-                           concurrency, delay, timeout, console):
+                           concurrency, delay, timeout, console, seeds=None):
     base = base.rstrip("/")
     sigs = await calibrate(session, base, timeout)
     if sigs:
         console.print(f"  [dim]soft-404 baseline: {sigs}[/]")
+    if any(s["status"] == 200 for s in sigs):
+        console.print("  [yellow]wildcard 200 detected (SPA/catch-all): filtering by body "
+                      "content, not just size.[/]")
 
-    candidates = []
-    for w in words:
+    candidates, seen = [], set()
+    for w in list(seeds or []) + list(words):
+        w = w.strip().lstrip("/")
+        if not w or w in seen:
+            continue
+        seen.add(w)
         candidates.append(w)
         for e in exts:
-            candidates.append(f"{w}.{e.lstrip('.')}")
+            ew = f"{w}.{e.lstrip('.')}"
+            if ew not in seen:
+                seen.add(ew)
+                candidates.append(ew)
 
     q = asyncio.Queue()
     for c in candidates:
@@ -493,10 +592,10 @@ async def discover_content(session, base, words, exts, match_codes,
                     await asyncio.sleep(delay)
                 async with session.get(url, allow_redirects=False,
                                        timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                    body = await resp.content.read(2048)
+                    body = await resp.content.read(4096)
                     length = int(resp.headers.get("Content-Length") or len(body))
                     st = resp.status
-                    if st in match and not is_fp(st, length, sigs):
+                    if st in match and not is_fp(st, length, _body_hash(body), sigs):
                         loc = resp.headers.get("Location", "")
                         ct = resp.headers.get("Content-Type", "").split(";")[0]
                         hits.append(ContentHit(url=url, status=st, length=length,
@@ -794,12 +893,22 @@ async def run(args, cfg, console):
                         exts = [e.strip() for e in exts_src if e and e.strip()]
                         match_codes = (parse_int_list(args.match_codes)
                                        if args.match_codes else d.get("match_codes"))
+                        seeds, seen_seed = [], set()
+                        for r in http_results:
+                            for lp in (r.links or []):
+                                if lp not in seen_seed:
+                                    seen_seed.add(lp)
+                                    seeds.append(lp)
+                        if seeds:
+                            console.print(f"[dim]{len(seeds)} path(s) seeded from in-page links.[/]")
                         for base in bases:
                             console.print(f"[bold]Enumerating[/] {base}  "
-                                          f"({len(words)} words, ext={exts or 'none'})")
+                                          f"({len(words)} words + {len(seeds)} link seeds, "
+                                          f"ext={exts or 'none'})")
                             hits, sigs = await discover_content(
                                 session, base, words, exts, match_codes,
-                                args.http_concurrency, args.delay, args.http_timeout, console)
+                                args.http_concurrency, args.delay, args.http_timeout, console,
+                                seeds=seeds)
                             content_sections.append({
                                 "base": base,
                                 "hits": [asdict(h) for h in hits],
@@ -874,6 +983,10 @@ def build_parser():
     p.add_argument("--output", default=None, help="output directory")
     p.add_argument("--config", default="config.yaml", help="config file path")
     p.add_argument("--yes", "-y", action="store_true", help="skip authorization confirmation")
+    p.add_argument("--interactive", "-i", action="store_true",
+                   help="interactive menu: pick target, phases, wordlist, etc.")
+    p.add_argument("--no-builtin", action="store_true",
+                   help="do not include the built-in high-signal path list")
     # vulnerability detection (opt-in; wraps external DETECTION scanners)
     p.add_argument("--vuln", action="store_true",
                    help="add the vuln phase (runs nuclei + wpscan, detection-only)")
@@ -904,6 +1017,63 @@ def apply_defaults(args, cfg):
         args.delay = float(d.get("delay", 0.0))
 
 
+def interactive_setup(args, cfg, console):
+    """Simple nmap-style menu: assemble a run, show the command, then proceed."""
+    def ask(prompt, default=""):
+        try:
+            v = input(f"{prompt} " + (f"[{default}] " if default else "")).strip()
+        except EOFError:
+            return default
+        return v or default
+
+    console.print(f"[bold yellow]{BANNER}[/]")
+    console.print("[bold]Interactive setup[/] - press Enter to accept the [default].")
+
+    if ask("Target by (1) host/IP or (2) URL?", "1") == "2":
+        args.url = ask("URL to test:", args.url or "https://example.com")
+    else:
+        args.target = ask("Host or IP:", args.target or "")
+
+    console.print("Phases: 1=resolve 2=ports 3=http 4=content 5=vuln")
+    sel = ask("Choose phases (comma numbers, or 'all'):", "all")
+    if sel.lower() == "all":
+        chosen = ["resolve", "ports", "http", "content"]
+    else:
+        names = {"1": "resolve", "2": "ports", "3": "http", "4": "content", "5": "vuln"}
+        chosen = [names[s.strip()] for s in sel.split(",") if s.strip() in names] \
+            or ["resolve", "ports", "http", "content"]
+    if "vuln" in chosen:
+        args.vuln = True
+        chosen = [c for c in chosen if c != "vuln"]
+    args.phases = ",".join(chosen)
+
+    if not args.url and "ports" in chosen:
+        args.ports = ask("Ports (common | full | 1-1024 | 80,443):", args.ports or "common")
+    if "content" in chosen:
+        args.wordlist = ask("Wordlist (common|small|medium|big|exposed|api|path):",
+                            args.wordlist or "common")
+        args.extensions = ask("Extensions (blank = none), e.g. php,txt:",
+                              args.extensions or "") or None
+    if args.vuln:
+        args.wpscan_api_token = ask("WPScan API token (blank = skip):",
+                                    args.wpscan_api_token or "") or None
+        args.severity = ask("Nuclei severities:", args.severity or "low,medium,high,critical")
+
+    tgt = f"--url {args.url}" if args.url else (args.target or "")
+    cmd = f"python reconflow.py {tgt} --phases {args.phases}"
+    if not args.url and "ports" in chosen:
+        cmd += f" --ports {args.ports}"
+    if "content" in chosen:
+        cmd += f" --wordlist {args.wordlist}"
+        if args.extensions:
+            cmd += f" --extensions {args.extensions}"
+    if args.vuln:
+        cmd += " --vuln"
+        if args.severity:
+            cmd += f" --severity {args.severity}"
+    console.print(f"\n[bold]Equivalent command:[/]\n  {cmd}\n")
+
+
 def authorization_gate(args, console):
     target = args.url or args.target
     console.print(f"[bold yellow]{BANNER}[/]")
@@ -925,10 +1095,12 @@ def authorization_gate(args, console):
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    cfg = load_config(args.config)
+    if args.interactive:
+        interactive_setup(args, cfg, _console)
     if not args.target and not args.url:
         parser.print_help()
         sys.exit(1)
-    cfg = load_config(args.config)
     apply_defaults(args, cfg)
     if not authorization_gate(args, _console):
         _console.print("[red]Aborted.[/]")
