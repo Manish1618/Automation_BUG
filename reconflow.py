@@ -150,6 +150,7 @@ DEFAULT_CONFIG = {
         "delay": 0.0, "extensions": [],
         "match_codes": [200, 204, 301, 302, 307, 401, 403, 405, 500],
         "user_agent": "ReconFlow/1.0 (+authorized-security-testing)",
+        "mode": "sequential", "max_parallel_hosts": 5,
         "nuclei_bin": "nuclei", "wpscan_bin": "wpscan",
         "severity": "low,medium,high,critical", "nuclei_rate": 150,
         "wpscan_api_token": "",
@@ -239,6 +240,17 @@ def parse_ports(spec, common):
 
 def parse_int_list(s):
     return [int(x) for x in str(s).split(",") if str(x).strip()]
+
+
+async def bounded_gather(factories, limit):
+    """Run zero-arg coroutine factories concurrently, at most `limit` at once."""
+    sem = asyncio.Semaphore(max(1, limit))
+
+    async def _run(factory):
+        async with sem:
+            return await factory()
+
+    return await asyncio.gather(*(_run(f) for f in factories))
 
 
 def make_url(scheme, host, port):
@@ -822,7 +834,8 @@ def mine_js_body(body):
     return paths, urls, secrets
 
 
-async def mine_endpoints(session, http_results, domain, timeout, console):
+async def mine_endpoints(session, http_results, domain, timeout, console,
+                         parallel=False, limit=10):
     paths, endpoints, secrets, js_files = set(), set(), [], []
     js_urls = []
     for r in http_results:
@@ -834,11 +847,19 @@ async def mine_endpoints(session, http_results, domain, timeout, console):
             if low.endswith(".js") or ".js?" in low:
                 js_urls.append(origin + "/" + lp.lstrip("/"))
     js_urls = list(dict.fromkeys(js_urls))[:15]
-    for ju in js_urls:
+    async def fetch_js(ju):
         try:
             async with session.get(ju, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                body = await resp.content.read(500_000)
+                return ju, await resp.content.read(500_000)
         except Exception:
+            return ju, None
+
+    if parallel:
+        fetched = await bounded_gather([(lambda u=ju: fetch_js(u)) for ju in js_urls], limit)
+    else:
+        fetched = [await fetch_js(ju) for ju in js_urls]
+    for ju, body in fetched:
+        if body is None:
             continue
         js_files.append(ju)
         pp, uu, ss = mine_js_body(body)
@@ -1124,10 +1145,16 @@ async def run(args, cfg, console):
                     web_ports = open_ports if open_ports else FALLBACK_WEB_PORTS
                     if not open_ports:
                         console.print("[dim]No port results; probing common web ports.[/]")
-                    for port in web_ports:
-                        res = await probe_http(session, target, port, args.http_timeout, console)
-                        if res:
-                            http_results.append(res)
+                    if args.mode == "parallel":
+                        probed = await bounded_gather(
+                            [(lambda pt=port: probe_http(session, target, pt, args.http_timeout, console))
+                             for port in web_ports], args.max_parallel_hosts)
+                        http_results.extend([r for r in probed if r])
+                    else:
+                        for port in web_ports:
+                            res = await probe_http(session, target, port, args.http_timeout, console)
+                            if res:
+                                http_results.append(res)
 
             if "mine" in phases:
                 console.rule("[bold]Endpoint mining (JS + Wayback)")
@@ -1137,7 +1164,9 @@ async def run(args, cfg, console):
                     dom_m = target
                 else:
                     dom_m = None
-                mined = await mine_endpoints(session, http_results, dom_m, args.http_timeout, console)
+                mined = await mine_endpoints(session, http_results, dom_m, args.http_timeout, console,
+                                             parallel=(args.mode == "parallel"),
+                                             limit=args.max_parallel_hosts)
                 for s in mined.get("secrets", []):
                     vuln_findings.append(VulnFinding("mine", f"Possible {s['type']} in JS",
                                                      "medium", s["location"], ""))
@@ -1147,9 +1176,16 @@ async def run(args, cfg, console):
                 bases_a = compute_bases(args, http_results)
                 if not bases_a:
                     console.print("[yellow]No live endpoint to audit.[/]")
-                for base in bases_a:
-                    console.print(f"[bold]Auditing[/] {base}")
-                    vuln_findings += await audit_endpoint(session, base, args.http_timeout, console)
+                if args.mode == "parallel":
+                    audit_lists = await bounded_gather(
+                        [(lambda b=base: audit_endpoint(session, b, args.http_timeout, console))
+                         for base in bases_a], args.max_parallel_hosts)
+                    for fl in audit_lists:
+                        vuln_findings += fl
+                else:
+                    for base in bases_a:
+                        console.print(f"[bold]Auditing[/] {base}")
+                        vuln_findings += await audit_endpoint(session, base, args.http_timeout, console)
 
             if "content" in phases:
                 console.rule("[bold]Phase 4 - Content discovery")
@@ -1176,7 +1212,7 @@ async def run(args, cfg, console):
                                 seeds.append(mp)
                         if seeds:
                             console.print(f"[dim]{len(seeds)} path(s) seeded from in-page links.[/]")
-                        for base in bases:
+                        async def enum_base(base):
                             console.print(f"[bold]Enumerating[/] {base}  "
                                           f"({len(words)} words + {len(seeds)} link seeds, "
                                           f"ext={exts or 'none'})")
@@ -1184,12 +1220,18 @@ async def run(args, cfg, console):
                                 session, base, words, exts, match_codes,
                                 args.http_concurrency, args.delay, args.http_timeout, console,
                                 seeds=seeds)
-                            content_sections.append({
-                                "base": base,
-                                "hits": [asdict(h) for h in hits],
-                                "signatures": sigs,
-                            })
                             console.print(f"[bold]{len(hits)} path(s) found on {base}.[/]")
+                            return {"base": base,
+                                    "hits": [asdict(h) for h in hits],
+                                    "signatures": sigs}
+
+                        if args.mode == "parallel" and len(bases) > 1:
+                            content_sections.extend(await bounded_gather(
+                                [(lambda b=base: enum_base(b)) for base in bases],
+                                args.max_parallel_hosts))
+                        else:
+                            for base in bases:
+                                content_sections.append(await enum_base(base))
 
     if "vuln" in phases:
         console.rule("[bold]Phase 5 - Vulnerability detection (nuclei + wpscan)")
@@ -1264,6 +1306,12 @@ def build_parser():
                    help="interactive menu: pick target, phases, wordlist, etc.")
     p.add_argument("--no-builtin", action="store_true",
                    help="do not include the built-in high-signal path list")
+    # run mode: sequential (previous, default) or parallel (faster)
+    p.add_argument("--mode", choices=["sequential", "parallel"], default=None,
+                   help="sequential (step-by-step, default) or parallel (faster)")
+    p.add_argument("--parallel", action="store_true", help="shortcut for --mode parallel")
+    p.add_argument("--max-parallel-hosts", type=int, default=None,
+                   help="max hosts/endpoints processed at once in parallel mode (default 5)")
     # recon add-ons (opt-in phases)
     p.add_argument("--subs", action="store_true",
                    help="subdomain enumeration phase (crt.sh, then DNS resolve)")
@@ -1301,6 +1349,10 @@ def apply_defaults(args, cfg):
         args.http_timeout = float(d.get("http_timeout", 8.0))
     if args.delay is None:
         args.delay = float(d.get("delay", 0.0))
+    if args.mode is None:
+        args.mode = "parallel" if getattr(args, "parallel", False) else str(d.get("mode", "sequential"))
+    if args.max_parallel_hosts is None:
+        args.max_parallel_hosts = int(d.get("max_parallel_hosts", 5))
 
 
 def interactive_setup(args, cfg, console):
@@ -1345,8 +1397,11 @@ def interactive_setup(args, cfg, console):
                                     args.wpscan_api_token or "") or None
         args.severity = ask("Nuclei severities:", args.severity or "low,medium,high,critical")
 
+    args.mode = "parallel" if ask("Run mode: (1) sequential or (2) parallel?", "1") == "2" \
+        else "sequential"
+
     tgt = f"--url {args.url}" if args.url else (args.target or "")
-    cmd = f"python reconflow.py {tgt} --phases {args.phases}"
+    cmd = f"python reconflow.py {tgt} --phases {args.phases} --mode {args.mode}"
     if not args.url and "ports" in chosen:
         cmd += f" --ports {args.ports}"
     if "content" in chosen:
@@ -1365,6 +1420,9 @@ def authorization_gate(args, console):
     console.print(f"[bold yellow]{BANNER}[/]")
     console.print(f"Target: [bold]{target}[/]")
     console.print(f"Phases: {args.phases}")
+    console.print(f"Mode: {getattr(args, 'mode', 'sequential')}"
+                  + (f" (max {args.max_parallel_hosts} parallel hosts)"
+                     if getattr(args, 'mode', '') == 'parallel' else ""))
     console.print("[yellow]Proceed only against systems you are explicitly authorized to test.[/]")
     if args.yes:
         return True

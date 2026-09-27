@@ -136,6 +136,9 @@ Example: `--wordlist common,exposed`
 | `--output DIR` | Report output directory. |
 | `--yes` | Skip the authorization prompt. |
 | `-i`, `--interactive` | Interactive menu: pick target, phases, wordlist, etc. (nmap-style). |
+| `--mode` | `sequential` (default, step-by-step) or `parallel` (faster). |
+| `--parallel` | Shortcut for `--mode parallel`. |
+| `--max-parallel-hosts` | In parallel mode, hosts/endpoints handled at once (default 5). |
 | `--no-builtin` | Skip the built-in high-signal path list (use only your wordlist). |
 | `--subs` | Subdomain enumeration (crt.sh + resolve). Add `--no-subs-resolve` to skip DNS. |
 | `--mine` | Endpoint mining: parse linked JS (paths + secret patterns) + Wayback URLs. |
@@ -174,6 +177,29 @@ Two extras catch obvious pages like `/login` and `/register` even with a small l
 - **In-page link extraction** — ReconFlow reads the page it already fetched in the HTTP
   phase and seeds any same-site links (`href`/`src`/`action`) into content discovery, so
   routes linked from the homepage are found even when no wordlist contains them.
+
+---
+
+## Run modes: sequential vs parallel
+
+ReconFlow has two run modes; pick with `--mode` (or the config `mode:` default):
+
+- **`sequential`** (default) — the original step-by-step system. Within each phase the
+  heavy loops (port scan, content discovery, subdomain resolve) are still concurrent, but
+  phases and per-host work run one after another. Cleanest live output, gentlest on targets.
+- **`parallel`** — also parallelizes the per-host loops: HTTP-probing multiple ports,
+  auditing multiple endpoints, fetching JS files, and enumerating multiple hosts all run
+  at once (bounded by `--max-parallel-hosts`, default 5). Measured ~2× faster on a
+  multi-host target in testing; results are identical.
+
+```bash
+python reconflow.py example.com --mode parallel          # faster
+python reconflow.py example.com --parallel               # same thing
+python reconflow.py example.com --mode parallel --max-parallel-hosts 10
+```
+
+Parallel mode is louder (more concurrent requests) — dial `--max-parallel-hosts`,
+`--http-concurrency`, and `--delay` down on sensitive production targets.
 
 ---
 
