@@ -41,6 +41,14 @@ try:
 except Exception:
     yaml = None
 
+# Arbitrary servers return non-UTF-8 bytes in headers/titles; make the terminal
+# writer tolerant so a stray byte can never crash a scan mid-run.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 try:
     from rich.console import Console
     _console = Console()
@@ -269,6 +277,29 @@ def urls_for_port(host, port):
     return [make_url("http", host, port), make_url("https", host, port)]
 
 
+def clean_text(s):
+    """Drop surrogate/control chars so arbitrary server bytes can't crash output.
+
+    Non-UTF-8 header/title bytes get decoded to lone surrogates (\\udcXX); writing
+    those to a UTF-8 terminal or file raises UnicodeEncodeError, so we strip them.
+    """
+    if not s:
+        return s
+    return "".join(c for c in str(s)
+                   if c == " " or (c.isprintable() and not 0xD800 <= ord(c) <= 0xDFFF))
+
+
+def scrub(obj):
+    """Recursively clean every string in a report structure before writing it out."""
+    if isinstance(obj, str):
+        return clean_text(obj)
+    if isinstance(obj, list):
+        return [scrub(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: scrub(v) for k, v in obj.items()}
+    return obj
+
+
 def extract_title(body):
     m = TITLE_RE.search(body or b"")
     if not m:
@@ -277,7 +308,7 @@ def extract_title(body):
         t = m.group(1).decode("utf-8", "ignore")
     except Exception:
         t = ""
-    return " ".join(t.split())[:200]
+    return clean_text(" ".join(t.split())[:200])
 
 
 def extract_links(body, base_url):
@@ -484,10 +515,10 @@ async def _probe_one(session, url, timeout):
             final_url=str(resp.url),
             port=p.port or (443 if p.scheme == "https" else 80),
             status=resp.status,
-            server=resp.headers.get("Server", ""),
-            powered_by=resp.headers.get("X-Powered-By", ""),
+            server=clean_text(resp.headers.get("Server", "")),
+            powered_by=clean_text(resp.headers.get("X-Powered-By", "")),
             title=extract_title(body),
-            content_type=resp.headers.get("Content-Type", "").split(";")[0],
+            content_type=clean_text(resp.headers.get("Content-Type", "").split(";")[0]),
             length=int(resp.headers.get("Content-Length") or len(body)),
             tech=detect_tech(resp.headers, body),
             links=extract_links(body, str(resp.url)),
@@ -608,8 +639,8 @@ async def discover_content(session, base, words, exts, match_codes,
                     length = int(resp.headers.get("Content-Length") or len(body))
                     st = resp.status
                     if st in match and not is_fp(st, length, _body_hash(body), sigs):
-                        loc = resp.headers.get("Location", "")
-                        ct = resp.headers.get("Content-Type", "").split(";")[0]
+                        loc = clean_text(resp.headers.get("Location", ""))
+                        ct = clean_text(resp.headers.get("Content-Type", "").split(";")[0])
                         hits.append(ContentHit(url=url, status=st, length=length,
                                                content_type=ct, redirect=loc))
                         extra = f" -> {loc}" if loc else ""
@@ -1083,6 +1114,16 @@ def write_html(path, r):
 # ---- orchestrator ----------------------------------------------------------
 async def run(args, cfg, console):
     d = cfg["defaults"]
+    # A service that redirects to an unresolvable host makes aiohttp raise gaierror
+    # in a background task; that is benign for a scanner, so don't spam the console.
+    def _quiet_handler(loop, context):
+        if isinstance(context.get("exception"), socket.gaierror):
+            return
+        loop.default_exception_handler(context)
+    try:
+        asyncio.get_running_loop().set_exception_handler(_quiet_handler)
+    except Exception:
+        pass
     started = datetime.now(timezone.utc)
     t0 = time.time()
     phases = [p.strip() for p in args.phases.split(",") if p.strip()]
@@ -1266,6 +1307,7 @@ async def run(args, cfg, console):
         "mined": mined,
         "vuln": [asdict(v) for v in vuln_findings],
     }
+    report = scrub(report)  # strip any surrogate/control bytes from server responses
     outdir = Path(args.output or default_outdir(target))
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
