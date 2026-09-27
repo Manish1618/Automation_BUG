@@ -459,14 +459,16 @@ def is_web_surface(r):
     return r.port in WEB_PORTS or scheme == "https"
 
 
-def compute_bases(args, http_results, web_only=False, fuzz_all=False):
-    """Origins to target. With web_only, keep just HTTP/HTTPS web surfaces
-    (unless fuzz_all overrides). Returns (bases, skipped_count)."""
+def compute_bases(args, http_results, web_only=False):
+    """Origins to fuzz/audit. Every genuine HTTP/HTTPS responder is a web surface
+    (a real web server on a non-standard port still counts). With web_only, restrict
+    to recognized web ports to tame hosts that fake HTTP everywhere. Returns
+    (bases, skipped_count)."""
     if args.url:
         return [args.url.rstrip("/")], 0
     seen, out, skipped = set(), [], 0
     for r in http_results:
-        if web_only and not fuzz_all and not is_web_surface(r):
+        if web_only and not is_web_surface(r):
             skipped += 1
             continue
         b = (r.final_url or r.url).rstrip("/")
@@ -1183,6 +1185,9 @@ async def run(args, cfg, console):
         open_ports = await scan_ports(scan_ip, ports, args.port_concurrency,
                                       args.port_timeout, console)
         console.print(f"[bold]{len(open_ports)} open port(s).[/]")
+        if not open_ports and str(args.ports).lower() not in ("full", "all"):
+            console.print("[yellow]0 open in this set. If the host is up (try `ping`), run "
+                          "--ports full — the service may be on a non-standard port.[/]")
 
     need_http = any(p in phases for p in ("subs", "http", "content", "vuln", "mine", "audit"))
     if need_http and aiohttp is None:
@@ -1242,13 +1247,13 @@ async def run(args, cfg, console):
 
             if "audit" in phases:
                 console.rule("[bold]Security audit (headers / CORS / cookies / TLS)")
-                bases_a, skipped_a = compute_bases(args, http_results, web_only=True,
-                                                   fuzz_all=args.fuzz_all_http)
+                bases_a, skipped_a = compute_bases(args, http_results,
+                                                   web_only=args.web_ports_only)
                 if skipped_a:
                     console.print(f"[dim]auditing {len(bases_a)} web surface(s); skipped "
-                                  f"{skipped_a} non-web HTTP responder(s).[/]")
+                                  f"{skipped_a} non-web-port responder(s) (--web-ports-only).[/]")
                 if not bases_a:
-                    console.print("[yellow]No web endpoint to audit.[/]")
+                    console.print("[yellow]No HTTP endpoint to audit.[/]")
                 if args.mode == "parallel":
                     audit_lists = await bounded_gather(
                         [(lambda b=base: audit_endpoint(session, b, args.http_timeout, console))
@@ -1262,14 +1267,14 @@ async def run(args, cfg, console):
 
             if "content" in phases:
                 console.rule("[bold]Phase 4 - Content discovery")
-                bases, skipped_c = compute_bases(args, http_results, web_only=True,
-                                                 fuzz_all=args.fuzz_all_http)
+                bases, skipped_c = compute_bases(args, http_results,
+                                                 web_only=args.web_ports_only)
                 if skipped_c:
                     console.print(f"[dim]fuzzing {len(bases)} web surface(s); skipped {skipped_c} "
-                                  f"non-web HTTP responder(s) (use --fuzz-all-http to include).[/]")
+                                  f"non-web-port responder(s) (--web-ports-only).[/]")
                 if not bases:
-                    console.print("[yellow]No web endpoint to enumerate. "
-                                  "Pass --url, run the http phase, or use --fuzz-all-http.[/]")
+                    console.print("[yellow]No HTTP endpoint to enumerate. "
+                                  "Run the http phase or pass --url.[/]")
                 else:
                     words = load_words(args, cfg, console)
                     if words is not None:
@@ -1312,8 +1317,7 @@ async def run(args, cfg, console):
 
     if "vuln" in phases:
         console.rule("[bold]Phase 5 - Vulnerability detection (nuclei + wpscan)")
-        targets, _ = compute_bases(args, http_results, web_only=True,
-                                   fuzz_all=args.fuzz_all_http)
+        targets, _ = compute_bases(args, http_results, web_only=args.web_ports_only)
         if not targets:
             console.print("[yellow]No live endpoint to scan. Run the http phase or pass --url.[/]")
         else:
@@ -1385,8 +1389,8 @@ def build_parser():
                    help="interactive menu: pick target, phases, wordlist, etc.")
     p.add_argument("--no-builtin", action="store_true",
                    help="do not include the built-in high-signal path list")
-    p.add_argument("--fuzz-all-http", action="store_true",
-                   help="fuzz/audit every HTTP responder, not just recognized web ports")
+    p.add_argument("--web-ports-only", action="store_true",
+                   help="restrict fuzzing/audit to recognized web ports (skip HTTP on odd ports)")
     # run mode: sequential (previous, default) or parallel (faster)
     p.add_argument("--mode", choices=["sequential", "parallel"], default=None,
                    help="sequential (step-by-step, default) or parallel (faster)")
