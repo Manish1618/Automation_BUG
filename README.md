@@ -140,6 +140,7 @@ Example: `--wordlist common,exposed`
 | `--parallel` | Shortcut for `--mode parallel`. |
 | `--max-parallel-hosts` | In parallel mode, hosts/endpoints handled at once (default 5). |
 | `--no-builtin` | Skip the built-in high-signal path list (use only your wordlist). |
+| `--fuzz-all-http` | Fuzz/audit every HTTP responder, not just recognized web ports. |
 | `--subs` | Subdomain enumeration (crt.sh + resolve). Add `--no-subs-resolve` to skip DNS. |
 | `--mine` | Endpoint mining: parse linked JS (paths + secret patterns) + Wayback URLs. |
 | `--audit` | Security audit: headers, CORS, cookie flags, TLS certificate. |
@@ -177,6 +178,11 @@ Two extras catch obvious pages like `/login` and `/register` even with a small l
 - **In-page link extraction** — ReconFlow reads the page it already fetched in the HTTP
   phase and seeds any same-site links (`href`/`src`/`action`) into content discovery, so
   routes linked from the homepage are found even when no wordlist contains them.
+
+**Which ports get fuzzed:** content discovery and the security audit run only against
+recognized **web ports** (or any HTTPS service) by default. A host that answers HTTP on
+non-web ports (RTSP/IPP/MQTT/Docker/etc.) is still listed under *HTTP services*, but not
+pointlessly fuzzed. Use `--fuzz-all-http` to fuzz every HTTP responder.
 
 ---
 

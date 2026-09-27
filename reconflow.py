@@ -96,6 +96,16 @@ NON_WEB_PORTS = {21, 22, 23, 25, 53, 110, 111, 135, 137, 139, 143, 161, 179,
                  3306, 3389, 5432, 5900, 6379, 11211, 27017, 27018, 5672}
 FALLBACK_WEB_PORTS = [80, 443, 8080, 8443, 8000, 3000, 5000]
 
+# Ports that conventionally host a real HTTP/HTTPS app. Content discovery and the
+# security audit only run against these by default, so a host that fakes HTTP on
+# non-web ports (RTSP/IPP/MQTT/Docker/etc.) doesn't get pointlessly fuzzed.
+# Any HTTPS service is always treated as a web surface regardless of port.
+WEB_PORTS = HTTP_PORTS | HTTPS_PORTS | {
+    80, 443, 81, 591, 2080, 3001, 4000, 4443, 5001, 7000, 7001, 7002, 8001,
+    8085, 8180, 8280, 8444, 8880, 9001, 9080, 9443, 10000,
+    2082, 2083, 2086, 2087, 2095, 2096,  # cPanel / WHM / webmail
+}
+
 TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
 # Attribute values that reference same-app resources (depth-1 link extraction).
 LINK_RE = re.compile(rb"""(?:href|src|action)\s*=\s*["']([^"'>\s]+)["']""", re.I)
@@ -436,18 +446,36 @@ def load_words(args, cfg, console):
     return words
 
 
-def compute_bases(args, http_results):
+def is_web_surface(r):
+    """True if this probed service is a genuine HTTP/HTTPS web surface worth fuzzing.
+
+    A web-port responder, or any HTTPS service on any port. This filters out hosts
+    that answer HTTP on non-web ports (RTSP/IPP/MQTT/Docker/etc.).
+    """
+    try:
+        scheme = urlparse(r.final_url or r.url).scheme
+    except Exception:
+        scheme = ""
+    return r.port in WEB_PORTS or scheme == "https"
+
+
+def compute_bases(args, http_results, web_only=False, fuzz_all=False):
+    """Origins to target. With web_only, keep just HTTP/HTTPS web surfaces
+    (unless fuzz_all overrides). Returns (bases, skipped_count)."""
     if args.url:
-        return [args.url.rstrip("/")]
-    seen, out = set(), []
+        return [args.url.rstrip("/")], 0
+    seen, out, skipped = set(), [], 0
     for r in http_results:
+        if web_only and not fuzz_all and not is_web_surface(r):
+            skipped += 1
+            continue
         b = (r.final_url or r.url).rstrip("/")
         p = urlparse(b)
         origin = f"{p.scheme}://{p.netloc}"
         if origin not in seen:
             seen.add(origin)
             out.append(origin)
-    return out
+    return out, skipped
 
 
 def default_outdir(target):
@@ -1214,9 +1242,13 @@ async def run(args, cfg, console):
 
             if "audit" in phases:
                 console.rule("[bold]Security audit (headers / CORS / cookies / TLS)")
-                bases_a = compute_bases(args, http_results)
+                bases_a, skipped_a = compute_bases(args, http_results, web_only=True,
+                                                   fuzz_all=args.fuzz_all_http)
+                if skipped_a:
+                    console.print(f"[dim]auditing {len(bases_a)} web surface(s); skipped "
+                                  f"{skipped_a} non-web HTTP responder(s).[/]")
                 if not bases_a:
-                    console.print("[yellow]No live endpoint to audit.[/]")
+                    console.print("[yellow]No web endpoint to audit.[/]")
                 if args.mode == "parallel":
                     audit_lists = await bounded_gather(
                         [(lambda b=base: audit_endpoint(session, b, args.http_timeout, console))
@@ -1230,10 +1262,14 @@ async def run(args, cfg, console):
 
             if "content" in phases:
                 console.rule("[bold]Phase 4 - Content discovery")
-                bases = compute_bases(args, http_results)
+                bases, skipped_c = compute_bases(args, http_results, web_only=True,
+                                                 fuzz_all=args.fuzz_all_http)
+                if skipped_c:
+                    console.print(f"[dim]fuzzing {len(bases)} web surface(s); skipped {skipped_c} "
+                                  f"non-web HTTP responder(s) (use --fuzz-all-http to include).[/]")
                 if not bases:
-                    console.print("[yellow]No HTTP endpoint to enumerate. "
-                                  "Pass --url or run the http phase.[/]")
+                    console.print("[yellow]No web endpoint to enumerate. "
+                                  "Pass --url, run the http phase, or use --fuzz-all-http.[/]")
                 else:
                     words = load_words(args, cfg, console)
                     if words is not None:
@@ -1276,7 +1312,8 @@ async def run(args, cfg, console):
 
     if "vuln" in phases:
         console.rule("[bold]Phase 5 - Vulnerability detection (nuclei + wpscan)")
-        targets = compute_bases(args, http_results)
+        targets, _ = compute_bases(args, http_results, web_only=True,
+                                   fuzz_all=args.fuzz_all_http)
         if not targets:
             console.print("[yellow]No live endpoint to scan. Run the http phase or pass --url.[/]")
         else:
@@ -1348,6 +1385,8 @@ def build_parser():
                    help="interactive menu: pick target, phases, wordlist, etc.")
     p.add_argument("--no-builtin", action="store_true",
                    help="do not include the built-in high-signal path list")
+    p.add_argument("--fuzz-all-http", action="store_true",
+                   help="fuzz/audit every HTTP responder, not just recognized web ports")
     # run mode: sequential (previous, default) or parallel (faster)
     p.add_argument("--mode", choices=["sequential", "parallel"], default=None,
                    help="sequential (step-by-step, default) or parallel (faster)")
