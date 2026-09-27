@@ -1,0 +1,42 @@
+# ReconFlow configuration
+# Edit paths/presets to match your machine. CLI flags override these values.
+
+# Where your SecLists clone lives. The first existing path wins.
+# Windows: git clone https://github.com/danielmiessler/SecLists C:/Tools/SecLists
+seclists_paths:
+  - /usr/share/seclists
+  - /usr/share/wordlists/seclists
+  - ~/SecLists
+  - ~/tools/SecLists
+  - ./SecLists
+  - C:/Tools/SecLists
+  - C:/SecLists
+
+# Friendly names -> path relative to the SecLists base above.
+wordlists:
+  common:  Discovery/Web-Content/common.txt
+  small:   Discovery/Web-Content/directory-list-2.3-small.txt
+  medium:  Discovery/Web-Content/directory-list-2.3-medium.txt
+  big:     Discovery/Web-Content/big.txt
+  raft:    Discovery/Web-Content/raft-small-directories.txt
+  exposed: Discovery/Web-Content/quickhits.txt        # .git, .env, backups, sensitive files
+  api:     Discovery/Web-Content/api/api-endpoints.txt
+
+defaults:
+  ports: common
+  wordlist: common
+  http_concurrency: 30
+  port_concurrency: 500
+  port_timeout: 1.0
+  http_timeout: 8.0
+  delay: 0.0
+  extensions: []
+  match_codes: [200, 204, 301, 302, 307, 401, 403, 405, 500]
+  user_agent: "ReconFlow/1.0 (+authorized-security-testing)"
+
+  # --- vuln phase (opt-in via --vuln; detection-only) ---
+  nuclei_bin: nuclei                    # binary name / path
+  wpscan_bin: wpscan
+  severity: low,medium,high,critical    # nuclei severities to report
+  nuclei_rate: 150                      # nuclei max requests/sec
+  wpscan_api_token: ""                  # free token at https://wpscan.com/api enables the vuln DB
